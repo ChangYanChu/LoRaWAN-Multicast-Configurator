@@ -45,8 +45,8 @@ Sample configuration [`config.ini`](config.ini)
     #Replace with your ChirpStack server host address
     server_host = 127.0.0.1
 
-    #Replace with your ChirpStack gRPC port
-    grpc_port = 8080
+    #Replace with your ChirpStack REST API URL
+    api_url = http://127.0.0.1:8090
 
     #Replace with your ChirpStack MQTT port
     mqtt_port = 1883
@@ -71,14 +71,20 @@ Sample configuration [`config.ini`](config.ini)
     #list of gateway id (comma separated)
     gateway_id_list = gateway-id-00001, gateway-id-00002
 
+    #ChirpStack region enum, e.g. EU868, US915, CN470
+    region = CN470
+
     #LoRaWAN data rate index for multicast transmissions; Lower DR (e.g., DR0 = SF12) gives better coverage (default is 0)
     data_rate = 0
 
-    #LoRaWAN Frequency (in Hz); For EU868, common multicast frequency: 869525000
-    freq = 869525000
+    #LoRaWAN multicast Class C frequency (in Hz); must match device region and gateway support
+    frequency = 500300000
     
     #Timeout for acknowledgement uplink message in seconds (default is 120)
     ack_uplink_timeout = 120
+
+    #Wait after queuing AppTimeAns before sending McClassCSessionReq
+    clock_sync_downlink_grace_seconds = 10
 
     #Session Timeout duration in seconds is 2^TimeOut (Example: TimeOut=8 means 256 seconds)
     session_timeout_exponent = 8
@@ -261,4 +267,3 @@ MIT License
 - Add application, devices and gateways in Chirpstack. 
 - Set Application key and Gen App Key (should be same with 'gen_app_key' in [config.ini](config.ini)) in Chirpstack devices. 
 ![Set Application key and Gen App Key in Chirpstack devices](./files/chirpstack-device-otaa-keys.png)
-

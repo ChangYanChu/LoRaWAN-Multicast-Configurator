@@ -7,7 +7,8 @@ from Crypto.Cipher import AES
 import paho.mqtt.client as mqtt
 from common import logger, TerminateProcessException, sleep, compare_dictionaries_by_keys, get_gps_epoch_seconds, gps_seconds_to_datetime, current_utc_time, time_remaining_till_target_time
 from config_manager import config
-from grpc_client import grpc_client_instance
+from clock_sync import LORAWAN_PORT_CLOCK_SYNC, encode_force_device_resync
+from api_client import api_client_instance
 from mqtt_client import subscribe_uplink, unsubscribe_uplink, wait_for_ack
 
 _mc_group_json = {}
@@ -198,19 +199,19 @@ def _verify_mcgroup_delete_req_payload(payload: bytes) -> bool:
 # Send FlushDeviceQueueRequest to all devices
 def _send_device_queue_flush_request() -> None:
     """Send McGroupSetupReq to all devices."""
-    grpc_client = grpc_client_instance(config)
+    api_client = api_client_instance(config)
     for dev_eui in config['dev_eui_list_in_group']:
-        grpc_client.flush_device_queue(dev_eui)
+        api_client.flush_device_queue(dev_eui)
         config['dev_eui_multicast_status_tracker'][dev_eui] = 'Queue Flushed'
     logger.info("All devices queue flushed successfully.")
 
 # Send McGroupSetupReq to all devices
 def _send_multicast_group_setup_request(McGroupID: int, McAddr: int, McKey_encrypted: bytes, minMcFCnt: int, maxMcFCnt: int) -> bytes:
     """Send McGroupSetupReq to all devices."""
-    grpc_client = grpc_client_instance(config)
+    api_client = api_client_instance(config)
     payload = _encode_mc_group_setup_request(McGroupID, McAddr, McKey_encrypted, minMcFCnt, maxMcFCnt)
     for dev_eui in config['dev_eui_list_in_group']:
-        grpc_client.enqueue_unicast_command(dev_eui, payload, f_port=200, flush=True)
+        api_client.enqueue_unicast_command(dev_eui, payload, f_port=200, flush=True)
         config['dev_eui_multicast_status_tracker'][dev_eui] = 'McGroupSetupReq Sent'
     logger.info(f"Enqueued McGroupSetupReq to all devices with McGroupID={McGroupID}, McAddr={McAddr}")
     return payload
@@ -218,42 +219,81 @@ def _send_multicast_group_setup_request(McGroupID: int, McAddr: int, McKey_encry
 # Send McClassCSessionReq to all devices
 def _send_multicast_class_c_session_request(McGroupID: int, SessionTime: int, SessionTimeOut: int, DLFreq: int, DR: int) -> bytes:
     """Send McClassCSessionReq to all devices."""
-    grpc_client = grpc_client_instance(config)
+    api_client = api_client_instance(config)
     payload = _encode_mc_class_c_session_request(McGroupID, SessionTime, SessionTimeOut, DLFreq, DR)
     for dev_eui in config['dev_eui_list_setup_done']:
-        grpc_client.enqueue_unicast_command(dev_eui, payload, f_port=200)
+        api_client.enqueue_unicast_command(dev_eui, payload, f_port=200)
     logger.info(f"Enqueued McClassCSessionReq {len(config['dev_eui_list_setup_done'])} devices with SessionTime={SessionTime}, SessionTimeOut={SessionTimeOut}")
     return payload
 
+def _send_clock_sync_force_resync_request(dev_eui_list: list[str]) -> None:
+    """Ask devices to emit a TS003 AppTimeReq so this tool can answer with AppTimeAns."""
+    api_client = api_client_instance(config)
+    payload = encode_force_device_resync(nb_transmissions=1)
+    for dev_eui in dev_eui_list:
+        api_client.enqueue_unicast_command(dev_eui, payload, f_port=LORAWAN_PORT_CLOCK_SYNC)
+    logger.info("Enqueued ForceDeviceResyncReq to %d devices, payload=%s", len(dev_eui_list), payload.hex().upper())
+
+def _wait_for_clock_sync(dev_eui_list: list[str]) -> bool:
+    """Wait until all target devices have an AppTimeAns queued and give it time to downlink."""
+    missing = [dev_eui for dev_eui in dev_eui_list if dev_eui not in config['dev_eui_list_clock_synced']]
+    if not missing:
+        logger.info("All target devices already have TS003 AppTimeAns queued.")
+        return True
+
+    logger.info("Waiting for TS003 AppTimeReq uplinks from devices before McClassCSessionReq: %s", missing)
+    clock_sync_ack = wait_for_ack("AppTimeAns", missing)
+    missing = [dev_eui for dev_eui in dev_eui_list if dev_eui not in config['dev_eui_list_clock_synced']]
+    if missing:
+        logger.warning("Devices still missing TS003 AppTimeReq/AppTimeAns: %s", missing)
+        logger.info("Requesting TS003 resync with ForceDeviceResyncReq.")
+        _send_clock_sync_force_resync_request(missing)
+        clock_sync_ack = wait_for_ack("AppTimeAns", missing)
+        missing = [dev_eui for dev_eui in dev_eui_list if dev_eui not in config['dev_eui_list_clock_synced']]
+
+    if missing:
+        return False
+
+    grace_seconds = config['clock_sync_downlink_grace_seconds']
+    if grace_seconds > 0:
+        logger.info(
+            "Waiting %d seconds after AppTimeAns queueing so Class A devices can receive it "
+            "before McClassCSessionReq.",
+            grace_seconds,
+        )
+        sleep(seconds=grace_seconds)
+    return clock_sync_ack
+
 def _send_multicast_group_delete_request_to_devices(McGroupID: int) -> None:
     """Send McGroupDeleteReq to all devices."""
-    grpc_client = grpc_client_instance(config)
+    api_client = api_client_instance(config)
     payload = _encode_mc_group_delete_request(McGroupID)
     for dev_eui in config['dev_eui_list_setup_done']:
-        grpc_client.enqueue_unicast_command(dev_eui, payload, f_port=200)
+        api_client.enqueue_unicast_command(dev_eui, payload, f_port=200)
         config['dev_eui_multicast_status_tracker'][dev_eui] = 'McGroupDeleteReq Sent'
     logger.info(f"Enqueued McGroupDeleteReq to all devices with McGroupID={McGroupID}")
 
 def _create_multicast_group() -> str:
     """Create multicast group."""
     global _mc_group_json
-    grpc_client = grpc_client_instance(config)
-    multicast_group_id = grpc_client.create_multicast_group(
+    api_client = api_client_instance(config)
+    multicast_group_id = api_client.create_multicast_group(
         name=str(_mc_group_json.get('name')),
         application_id=str(_mc_group_json.get('application_id')),
         mc_addr=f"{_mc_group_json.get('mc_addr'):08X}".upper(),
         mc_app_s_key=_mc_group_json.get('mc_app_s_key').hex().upper(),
         mc_nwk_s_key=_mc_group_json.get('mc_nwk_s_key').hex().upper(),
         dr=_mc_group_json.get('dr'),
-        freq=_mc_group_json.get('frequency')
+        freq=_mc_group_json.get('frequency'),
+        region=config['region'].upper()
     )
     return multicast_group_id
 
 def _add_devices_to_group(multicast_group_id: str, dev_eui_list) -> None:
     """Add devices to multicast group."""
-    grpc_client = grpc_client_instance(config)
+    api_client = api_client_instance(config)
     for dev_eui in dev_eui_list:
-        added = grpc_client.add_device_to_group(multicast_group_id, dev_eui, _mc_group_json.get('application_id'))
+        added = api_client.add_device_to_group(multicast_group_id, dev_eui, _mc_group_json.get('application_id'))
         if added:
             config['dev_eui_list_in_group'].append(dev_eui)
             config['dev_eui_multicast_status_tracker'][dev_eui] = 'Added to McGroup'
@@ -262,9 +302,9 @@ def _add_devices_to_group(multicast_group_id: str, dev_eui_list) -> None:
 
 def _add_gateways_to_group(multicast_group_id: str, gateway_id_list) -> None:
     """Add gateways to multicast group."""
-    grpc_client = grpc_client_instance(config)
+    api_client = api_client_instance(config)
     for gateway_id in gateway_id_list:
-        added = grpc_client.add_gateway_to_group(multicast_group_id, gateway_id, _mc_group_json.get('tenant_id'))
+        added = api_client.add_gateway_to_group(multicast_group_id, gateway_id, _mc_group_json.get('tenant_id'))
         if added:
             config['gateway_id_list_in_group'].append(gateway_id)
             config['gateway_id_multicast_status_tracker'][gateway_id] = 'Added to McGroup'
@@ -284,8 +324,8 @@ def _pupulate_session_parameters() -> None:
 
 def _delete_multicast_group(multicast_group_id: str) -> None:
     """Delete multicast group."""
-    grpc_client = grpc_client_instance(config)
-    grpc_client.delete_multicast_group(multicast_group_id)
+    api_client = api_client_instance(config)
+    api_client.delete_multicast_group(multicast_group_id)
 
 # Configure multicast group
 def configure_multicast_group() -> dict:
@@ -401,6 +441,11 @@ def setup_and_start_multicast_session() -> None:
             logger.warning("All devices reported errors with McGroupSetupReq. Exiting...")
             raise TerminateProcessException("All devices reported errors with McGroupSetupReq. Aborting multicast session start!")
 
+    clock_sync_done = _wait_for_clock_sync(config['dev_eui_list_setup_done'])
+    if not clock_sync_done:
+        logger.warning("No devices completed TS003 AppTimeAns. Exiting...")
+        raise TerminateProcessException("No devices completed TS003 clock synchronization. Aborting multicast session start.")
+
     _pupulate_session_parameters()
     logger.info(f"Starting multicast session with: {json.dumps({
         "SessionTime (UTC)": gps_seconds_to_datetime(_mc_group_json.get('session_time')).strftime('%Y-%m-%d %H:%M:%S'),
@@ -436,9 +481,9 @@ def enqueue_multicast_command() -> None:
     """Enqueue multicast command"""
     # Example: Enqueue dummy multicast command - TODO: replace with actual command
     multicast_group_id = _mc_group_json.get('id')
-    grpc_client = grpc_client_instance(config)
+    api_client = api_client_instance(config)
     payload, fport = bytes.fromhex("002A26"), 20    # Reads Battery%
-    grpc_client.enqueue_multicast_command(multicast_group_id, payload, fport)
+    api_client.enqueue_multicast_command(multicast_group_id, payload, fport)
 
 # Clean up multicast group
 def clean_up() -> None:

@@ -5,6 +5,8 @@ import paho.mqtt.client as mqtt
 from datetime import timedelta
 from config_manager import config
 from common import logger, TerminateProcessException, sleep, current_utc_time, time_remaining_till_target_time, base64_to_hex
+from clock_sync import LORAWAN_PORT_CLOCK_SYNC, encode_app_time_ans, parse_app_time_req
+from api_client import api_client_instance
 
 _mqtt_client = None
 
@@ -12,8 +14,33 @@ _mqtt_client = None
 _ack_tracker = {
     "McGroupSetupAns": set(),
     "McClassCSessionAns": set(),
-    "McGroupDeleteAns": set()
+    "McGroupDeleteAns": set(),
+    "AppTimeAns": set()
 }
+
+def _handle_clock_sync_uplink(dev_eui: str, payload_hex: str) -> None:
+    payload = bytes.fromhex(payload_hex)
+    device_seconds, token = parse_app_time_req(payload)
+    app_time_ans, current_gps, correction = encode_app_time_ans(device_seconds, token)
+    logger.info(
+        "Received AppTimeReq from device: %s, device_seconds=%d, token=%d, "
+        "current_gps=%d, correction=%d",
+        dev_eui,
+        device_seconds,
+        token,
+        current_gps,
+        correction,
+    )
+    logger.info("Enqueuing AppTimeAns to device: %s, payload=%s", dev_eui, app_time_ans.hex().upper())
+    api_client_instance(config).enqueue_unicast_command(
+        dev_eui,
+        app_time_ans,
+        f_port=LORAWAN_PORT_CLOCK_SYNC,
+    )
+    _ack_tracker["AppTimeAns"].add(dev_eui)
+    if dev_eui not in config['dev_eui_list_clock_synced']:
+        config['dev_eui_list_clock_synced'].append(dev_eui)
+    config['dev_eui_multicast_status_tracker'][dev_eui] = 'AppTimeAns Sent'
 
 # Parse McGroupSetupAns payload
 def _parse_mc_group_setup_ans(payload_hex) -> bool:
@@ -137,9 +164,11 @@ def _on_message(mqtt_client, userdata, msg) -> None:
         data = json.loads(msg.payload.decode("utf-8", errors="replace"))
         logger.debug(f"MQTT message received on topic: {msg.topic} -> {data}")
         dev_eui = data.get("deviceInfo", {}).get("devEui")
+        if dev_eui is not None:
+            dev_eui = dev_eui.lower()
         fPort = data.get("fPort")
         payload = data.get("data")
-        if fPort != 200 or dev_eui is None:
+        if dev_eui is None:
             logger.info(f"Ignored message on fPort: {fPort} from device: {dev_eui}")
             return
         if dev_eui not in config['dev_eui_list']:
@@ -147,6 +176,12 @@ def _on_message(mqtt_client, userdata, msg) -> None:
             return
         payload = base64_to_hex(payload)
         logger.info(f"Processing uplink message from device: {dev_eui} on fPort: {fPort}, payload: {payload}")
+        if fPort == LORAWAN_PORT_CLOCK_SYNC:
+            _handle_clock_sync_uplink(dev_eui, payload)
+            return
+        if fPort != 200:
+            logger.info(f"Ignored message on fPort: {fPort} from device: {dev_eui}")
+            return
         if len(payload) >= 4:
             cid = payload[0:2]  # First byte is CID
             payload_hex = payload[2:]  # Remaining bytes are payload
@@ -155,7 +190,8 @@ def _on_message(mqtt_client, userdata, msg) -> None:
                 _ack_tracker["McGroupSetupAns"].add(dev_eui)
                 config['dev_eui_multicast_status_tracker'][dev_eui] = 'McGroupSetupAns Received'
                 if _parse_mc_group_setup_ans(payload_hex):
-                    config['dev_eui_list_setup_done'].append(dev_eui)
+                    if dev_eui not in config['dev_eui_list_setup_done']:
+                        config['dev_eui_list_setup_done'].append(dev_eui)
                     config['dev_eui_multicast_status_tracker'][dev_eui] = 'McGroupSetupAns OK'
                     logger.info(f"Device {dev_eui} McGroupSetup completed successfully.")
                 else:
@@ -166,7 +202,8 @@ def _on_message(mqtt_client, userdata, msg) -> None:
                 _ack_tracker["McGroupDeleteAns"].add(dev_eui)
                 config['dev_eui_multicast_status_tracker'][dev_eui] = 'McGroupDeleteAns Received'
                 if _parse_mc_group_delete_ans(payload_hex):
-                    config['dev_eui_list_delete_done'].append(dev_eui)
+                    if dev_eui not in config['dev_eui_list_delete_done']:
+                        config['dev_eui_list_delete_done'].append(dev_eui)
                     config['dev_eui_multicast_status_tracker'][dev_eui] = 'McGroupDeleteAns OK'
                     logger.info(f"Device {dev_eui} McGroupDelete completed successfully.")
                 else:
@@ -177,7 +214,8 @@ def _on_message(mqtt_client, userdata, msg) -> None:
                 _ack_tracker["McClassCSessionAns"].add(dev_eui)
                 config['dev_eui_multicast_status_tracker'][dev_eui] = 'McClassCSessionAns Received'
                 if _parse_mc_class_c_session_ans(payload_hex):
-                    config['dev_eui_list_session_started'].append(dev_eui)
+                    if dev_eui not in config['dev_eui_list_session_started']:
+                        config['dev_eui_list_session_started'].append(dev_eui)
                     config['dev_eui_multicast_status_tracker'][dev_eui] = 'McClassCSessionAns OK'
                     logger.info(f"Device {dev_eui} McClassCSession scheduled successfully.")
                 else:

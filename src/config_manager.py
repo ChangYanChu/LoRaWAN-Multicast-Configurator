@@ -48,12 +48,12 @@ def _read_and_validate_config(parser, key: str, data_type: type, default: object
     if data_type is int and (value < min or value > max):
         raise ValueError(f"{key}; value must be between {min} and {max}")
     if key == 'dev_eui_list':
-        value = list(set([dev_eui.strip() for dev_eui in value.split(',')]))
+        value = list(set([dev_eui.strip().lower() for dev_eui in value.split(',')]))
         invalid_values = [dev_eui for dev_eui in value if len(dev_eui) != 16]
         if invalid_values:
             raise ValueError(f"{key}; unsupported device-eui {invalid_values}")
     elif key == 'gateway_id_list':
-        value = list(set([gw_id.strip() for gw_id in value.split(',')]))
+        value = list(set([gw_id.strip().lower() for gw_id in value.split(',')]))
         invalid_values = [gw_id for gw_id in value if len(gw_id) != 16]
         if invalid_values:
             raise ValueError(f"{key}; unsupported gateway_id {invalid_values}")
@@ -77,7 +77,7 @@ def read_config(file_path: str) -> None:
         config['tenant_id'] = parser.get('Configuration', 'tenant_id').lower()
         config['app_id'] = parser.get('Configuration', 'app_id').lower()
         config['server_host'] = parser.get('Configuration', 'server_host')
-        config['grpc_port'] = parser.getint('Configuration', 'grpc_port')
+        config['api_url'] = parser.get('Configuration', 'api_url', fallback=f"http://{config['server_host']}:8090")
         config['mqtt_port'] = parser.getint('Configuration', 'mqtt_port')
         config['mqtt_username'] = parser.get('Configuration', 'mqtt_username', fallback=None)
         config['mqtt_password'] = parser.get('Configuration', 'mqtt_password', fallback=None)
@@ -86,7 +86,7 @@ def read_config(file_path: str) -> None:
         #The GenAppKey (Generic Application Key) is used to derive the necessary session keys (McRootKey, McKEKey) for secure communication with a multicast group
         config['gen_app_key'] = parser.get('Configuration', 'gen_app_key').lower()
         
-        if not all([config['tenant_id'], config['app_id'], config['server_host'], config['grpc_port'], config['mqtt_port'], config['api_key'], config['gen_app_key']]):
+        if not all([config['tenant_id'], config['app_id'], config['server_host'], config['api_url'], config['mqtt_port'], config['api_key'], config['gen_app_key']]):
             raise KeyError("One or more required configuration fields are missing or empty.")
 
         #proxy and TLS configuration
@@ -104,9 +104,11 @@ def read_config(file_path: str) -> None:
         #optional coniguration
         config['dev_eui_list'] = _read_and_validate_config(parser, key='dev_eui_list', data_type=str, default='')
         config['gateway_id_list'] = _read_and_validate_config(parser, key='gateway_id_list', data_type=str, default='')
+        config['region'] = _read_and_validate_config(parser, key='region', data_type=str, default='CN470')
         config['data_rate'] = _read_and_validate_config(parser, key='data_rate', data_type=int, min=0, max=15, default=1)
         config['frequency'] = _read_and_validate_config(parser, key='frequency', data_type=int, min=0, max=928000000, default=869525000)
         config['ack_uplink_timeout'] = _read_and_validate_config(parser, key='ack_uplink_timeout', data_type=int, default=120, min=1, max=3600) # Default to 60 seconds if not specified
+        config['clock_sync_downlink_grace_seconds'] = _read_and_validate_config(parser, key='clock_sync_downlink_grace_seconds', data_type=int, default=10, min=0, max=300)
         config['session_timeout_exponent'] = _read_and_validate_config(parser, key='session_timeout_exponent', data_type=int, default=8, min=0, max=15) # Default to 256 seconds if not specified
         config['delete_mc_group_on_exit'] = _read_and_validate_config(parser, key='delete_mc_group_on_exit', data_type=bool, default=True) # Default to False if not specified
         config['dry_run'] = _read_and_validate_config(parser, key='dry_run', data_type=bool, default=False) # Default to False if not specified
@@ -124,6 +126,7 @@ def read_config(file_path: str) -> None:
         config['dl_freq'] = int(config['frequency'])//100       # type: ignore # Downlink frequency in Hz/100
         config['dev_eui_list_in_group'] = []                    # Track devices which are added to McGroup
         config['dev_eui_list_setup_done'] = []                  # Track devices which have completed McGroupSetup
+        config['dev_eui_list_clock_synced'] = []                 # Track devices which received TS003 AppTimeAns
         config['dev_eui_list_session_started'] = []             # Track devices which have completed McClassCSession start
         config['dev_eui_list_delete_done'] = []                 # Track devices which have completed McGroupDelete
         config['dev_eui_multicast_status_tracker'] = {}         # Track device multicast status
